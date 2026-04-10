@@ -1,0 +1,337 @@
+# Ente Photos — Self-Hosted with Garage S3
+
+Minimal, lightweight self-hosted [Ente Photos](https://ente.io) for a family server on a local network. Plain HTTP, no reverse proxy needed.
+
+Uses **Garage** (Rust-based S3) instead of MinIO for dramatically lower resource usage.
+
+## Quick Start
+
+```bash
+chmod +x setup.sh backup.sh
+./setup.sh
+```
+
+The setup script will:
+1. Ask for your server's LAN IP (auto-detected)
+2. Generate all secrets (JWT, encryption keys, Garage tokens)
+3. Start Garage + Postgres
+4. Create S3 buckets, API key, set CORS
+5. Patch config with real credentials
+6. Start all services
+
+After setup:
+- **Web UI:** `http://<your-ip>:3000`
+- **API:** `http://<your-ip>:8081`
+- **Sign up** with any `@example.org` email, OTP `123456`
+- **Remove 10 GB limit:** `docker compose exec -T postgres psql -U pguser ente_db < storage-fix.sql`
+
+### Mobile Apps (iOS & Android)
+
+Official apps from App Store / Play Store / F-Droid support custom servers:
+
+1. On the login screen, **tap 7 times** to open developer settings
+2. Enter server endpoint: `http://<your-ip>:8081`
+3. Sign up / log in normally
+
+No custom builds needed. Both Android (`usesCleartextTraffic=true`) and iOS (`NSAllowsArbitraryLoads=true`) allow plain HTTP.
+
+---
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    Docker Compose Stack                       │
+│                                                              │
+│  ┌─────────┐    ┌──────────┐    ┌────────┐                  │
+│  │  museum  │◄──│  socat    │──►│ garage  │                  │
+│  │ (Go API) │    │ :3200→   │    │ (Rust  │                  │
+│  │ :8080    │    │   :3900   │    │  S3)   │                  │
+│  └────┬─────┘    └──────────┘    └────────┘                  │
+│       │          shares museum's                             │
+│       │          network namespace                           │
+│       ▼                                                      │
+│  ┌──────────┐    ┌──────────────────────────┐                │
+│  │ postgres │    │           web             │                │
+│  │ :5432    │    │ :3000-3004 (nginx+static) │                │
+│  └──────────┘    └──────────────────────────┘                │
+└──────────────────────────────────────────────────────────────┘
+         Host ports: 8081 (API), 3000-3004 (web), 3200 (S3)
+```
+
+### Services (5 containers + 1 init)
+
+| Service    | Image                      | Purpose                                   |
+|------------|----------------------------|-------------------------------------------|
+| `museum`   | `ghcr.io/ente-io/server`   | Ente API server (Go binary)               |
+| `socat`    | `alpine/socat`             | Bridges museum's localhost:3200 → garage:3900 |
+| `postgres` | `postgres:17-bookworm`     | Database                                  |
+| `garage`   | `dxflrs/garage:v2.2.0`     | S3-compatible object storage (Rust)       |
+| `web`      | `ghcr.io/ente-io/web`      | Photos/Accounts/Albums/Auth/Cast web apps |
+| `garage-init` | `python:3.13-slim-bookworm` | One-shot: layout, buckets, API key, CORS |
+
+### Why Garage Instead of MinIO
+
+- **~30 MB** image vs ~300 MB+ for MinIO
+- **~30 MB RAM** idle vs ~250 MB+ for MinIO
+- Written in Rust, single binary, designed for small self-hosted setups
+- Single-node mode with `replication_factor = 1` and SQLite metadata engine
+- Total stack idle RAM: ~180 MB (vs ~430 MB with MinIO)
+
+### Why socat
+
+Museum hardcodes S3 access on `localhost:3200`. The socat container shares
+museum's network namespace (`network_mode: "service:museum"`) and forwards TCP
+to `garage:3900`. This matches the upstream self-hosting pattern.
+
+### Three Buckets, One Garage
+
+Museum hardcodes these three bucket names (they correspond to production storage
+providers). All three are created on the same Garage instance with the same API
+key. `replication: enabled: false` prevents museum from replicating across them.
+
+- `b2-eu-cen`
+- `wasabi-eu-central-2-v3`
+- `scw-eu-fr-v3`
+
+### S3 Endpoint & Presigned URLs
+
+The S3 endpoint in museum config uses `http://<your-ip>:3200` (LAN IP), not
+`localhost:3200`. This is because mobile apps and the web UI upload directly to
+**presigned S3 URLs** — these URLs must be reachable from the client device.
+Garage port 3900 is exposed as host port 3200.
+
+---
+
+## Files
+
+```
+ente/
+├── compose.yml.template   # Docker Compose template (placeholders for secrets)
+├── garage.toml.template   # Garage S3 config template
+├── garage-init.py         # One-shot: layout, buckets, API key, CORS
+├── cors.json              # S3 CORS rules (reference copy)
+├── setup.sh               # First-boot orchestrator (generates secrets, starts everything)
+├── storage-fix.sql        # Removes 10 GB storage limit (gives 100 TB / 100 years)
+├── backup.sh              # Photo export + DB backup script
+└── README.md              # This file
+```
+
+**Generated by `setup.sh` (not committed, contain secrets):**
+- `compose.yml` — live config with real credentials
+- `garage.toml` — live Garage config with real tokens
+
+### setup.sh
+
+Orchestrates first boot:
+
+1. Prompts for server IP (or uses `SERVER_IP` env var)
+2. Generates secrets with `openssl rand`
+3. Creates `compose.yml` and `garage.toml` from templates
+4. Starts postgres + garage
+5. Runs `garage-init.py` (creates layout, buckets, API key, CORS)
+6. Patches compose.yml with Garage S3 credentials
+7. Starts all services
+
+### garage-init.py
+
+Python script that configures Garage via its **v2 admin HTTP API**. It:
+
+1. Waits for Garage to be ready (polls `/v2/GetClusterHealth`)
+2. Gets the node ID from `/v2/GetClusterStatus`
+3. Assigns the node to the layout with 1 GB capacity
+   - **Critical:** The request body is `{"roles": [{"id": "...", "zone": "...", "capacity": ..., "tags": []}]}`
+   - The field is `id` (not `nodeId`) — the OpenAPI spec is misleading
+4. Applies the layout (`/v2/ApplyClusterLayout`)
+5. Creates three buckets + API key with permissions
+6. Sets CORS policy (`*` origin) on all buckets via S3 `PutBucketCors` with AWS SigV4
+
+**Why Python?** The Garage Docker image is distroless (no shell, no CLI). A
+Python container handles JSON and HTTP properly — shell scripts failed due to
+JSON escaping issues.
+
+---
+
+## Common Operations
+
+### Start / Stop / Restart
+
+```bash
+docker compose up -d          # start
+docker compose down            # stop
+docker compose restart museum  # restart one service
+docker compose logs -f museum  # follow logs
+```
+
+### Remove Storage Limit
+
+By default, new accounts get a 10 GB free-tier limit. After each user signs up:
+
+```bash
+docker compose exec -T postgres psql -U pguser ente_db < storage-fix.sql
+```
+
+Safe to run multiple times. Only updates users who still have the default limit.
+
+### Backup — Decrypted Photos + Database
+
+Ente encrypts all photos **client-side**. The files in Garage are encrypted
+blobs. `backup.sh` uses the Ente CLI to decrypt and export your photos to a
+plain folder, plus dumps the Postgres database.
+
+```bash
+./backup.sh login    # one-time interactive login
+./backup.sh          # export photos
+./backup.sh db       # dump postgres
+./backup.sh all      # both
+
+# Override backup location:
+ENTE_BACKUP_DIR=/path/to/backups ./backup.sh all
+```
+
+The CLI binary (v0.2.3) is auto-downloaded on first run. Uses
+`ENTE_CLI_SECRETS_PATH` to bypass keyring (required on headless servers).
+
+**Automated daily backup (cron):**
+```bash
+0 3 * * * cd /path/to/ente && ./backup.sh all >> ./backups/backup.log 2>&1
+```
+
+---
+
+## Security Hardening
+
+After creating all your family accounts:
+
+### Remove Hardcoded OTP
+
+Edit `compose.yml` and remove the `hardcoded-ott` block from `museum-yaml` config:
+
+```yaml
+      # REMOVE THIS BLOCK:
+      internal:
+        hardcoded-ott:
+          emails:
+            - ".*@example\\.org"
+          value: "123456"
+```
+
+Then: `docker compose up -d museum`
+
+### Secrets
+
+All secrets are generated by `setup.sh` and stored in `compose.yml` and
+`garage.toml` (plaintext). These files should not be committed or shared.
+
+| Secret | Location | Purpose |
+|--------|----------|---------|
+| JWT secret | compose.yml | Signs auth tokens |
+| Encryption key | compose.yml | Encrypts server-side keys |
+| Garage RPC secret | garage.toml | Internal Garage communication |
+| Garage admin token | garage.toml + compose.yml | Admin API access |
+| Garage S3 key ID + secret | compose.yml | S3 bucket access |
+| Postgres password (`pgpass`) | compose.yml | Database access |
+
+Fine for LAN-only. For internet exposure, use proper TLS and rotate secrets.
+
+---
+
+## Resource Usage
+
+| Service    | RAM (idle) | RAM (active) | Image Size |
+|------------|-----------|-------------|------------|
+| museum     | ~50 MB    | ~100-200 MB | ~50 MB     |
+| postgres   | ~80 MB    | ~150-300 MB | ~400 MB    |
+| garage     | ~30 MB    | ~50-100 MB  | ~30 MB     |
+| socat      | ~2 MB     | ~5 MB       | ~10 MB     |
+| web        | ~20 MB    | ~30 MB      | ~100 MB    |
+| **Total**  | **~180 MB** | **~400-650 MB** | **~590 MB** |
+
+Postgres tuned for low memory: `shared_buffers=128MB`, `max_connections=50`.
+
+---
+
+## Upgrading
+
+### Ente Server + Web
+
+```bash
+docker compose pull museum web
+docker compose up -d museum web
+```
+
+Museum runs database migrations automatically on startup.
+
+### Postgres (Major Version)
+
+```bash
+docker compose exec postgres pg_dump -U pguser ente_db > backup.sql
+docker compose down && docker volume rm ente_postgres-data
+# Update image tag in compose.yml
+docker compose up -d postgres
+docker compose exec -i postgres psql -U pguser ente_db < backup.sql
+docker compose up -d
+```
+
+### Garage S3
+
+Update the image tag in `compose.yml` and `compose.yml.template`:
+
+```bash
+docker compose pull garage
+docker compose up -d garage
+```
+
+**Garage v2 API quirks (as of v2.2.0):**
+- All admin endpoints require `Authorization: Bearer <token>` — including health checks
+- `UpdateClusterLayout` body: `{"roles": [{"id": ..., "zone": ..., "capacity": ..., "tags": [...]}]}`
+- The OpenAPI spec says `nodeId` but the Rust code expects `id`
+- v1 endpoints are completely removed
+
+---
+
+## Troubleshooting
+
+### Museum won't start
+
+- `docker compose logs museum`
+- Check postgres: `docker compose ps postgres`
+- Check for placeholder values in compose.yml (`__GARAGE_KEY_ID__` etc.)
+
+### Port already allocated
+
+Check `docker ps` for conflicts. Museum uses 8081, web uses 3000-3004, S3 uses 3200.
+
+### Upload failures
+
+S3 must be reachable from client devices at `http://<your-ip>:3200`:
+```bash
+curl -s -o /dev/null -w "%{http_code}" http://<your-ip>:3200/
+# 403 = working (no auth headers). Connection refused = broken.
+```
+
+If uploads fail with "No such key: __GARAGE_KEY_ID__", setup.sh didn't finish. Re-run it.
+
+### CORS errors in web UI
+
+S3 buckets need CORS rules. Re-apply with `aws-cli`:
+```bash
+for bucket in b2-eu-cen wasabi-eu-central-2-v3 scw-eu-fr-v3; do
+  docker run --rm --network ente_internal \
+    -v $(pwd)/cors.json:/cors.json:ro \
+    -e AWS_ACCESS_KEY_ID=<key-id-from-compose.yml> \
+    -e AWS_SECRET_ACCESS_KEY=<key-secret-from-compose.yml> \
+    amazon/aws-cli s3api put-bucket-cors \
+    --bucket "$bucket" --cors-configuration file:///cors.json \
+    --endpoint-url http://garage:3900 --region garage
+done
+```
+
+Or just re-run setup: `docker compose down -v && ./setup.sh`
+
+### Fresh start
+
+```bash
+docker compose down -v   # WARNING: destroys all data
+./setup.sh
+```

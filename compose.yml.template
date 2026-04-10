@@ -1,0 +1,156 @@
+services:
+  museum:
+    image: ghcr.io/ente-io/server
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      garage:
+        condition: service_started
+    environment:
+      ENTE_CREDENTIALS_FILE: /credentials.yaml
+    configs:
+      - source: museum-yaml
+        target: /museum.yaml
+      - source: credentials-yaml
+        target: /credentials.yaml
+    networks:
+      - internal
+
+  socat:
+    image: alpine/socat
+    restart: unless-stopped
+    command: TCP-LISTEN:3200,fork,reuseaddr TCP:garage:3900
+    network_mode: "service:museum"
+    depends_on:
+      garage:
+        condition: service_started
+
+  postgres:
+    image: postgres:17-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ente_db
+      POSTGRES_USER: pguser
+      POSTGRES_PASSWORD: pgpass
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=128MB"
+      - "-c"
+      - "max_connections=50"
+      - "-c"
+      - "work_mem=4MB"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pguser -d ente_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - internal
+
+  garage:
+    image: dxflrs/garage:v2.2.0
+    restart: unless-stopped
+    ports:
+      - "3200:3900"
+    volumes:
+      - ./garage.toml:/etc/garage.toml:ro
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
+    networks:
+      - internal
+
+  garage-init:
+    image: python:3.13-slim-bookworm
+    command: ["python3", "/garage-init.py"]
+    volumes:
+      - ./garage-init.py:/garage-init.py:ro
+    environment:
+      GARAGE_RPC_HOST: garage
+      GARAGE_ADMIN_TOKEN: __GARAGE_ADMIN_TOKEN__
+    depends_on:
+      garage:
+        condition: service_started
+    networks:
+      - internal
+    profiles:
+      - init
+
+  web:
+    image: ghcr.io/ente-io/web
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+      - "3001:3001"
+      - "3002:3002"
+      - "3003:3003"
+      - "3004:3004"
+    environment:
+      ENDPOINT: http://__SERVER_IP__:8081
+    networks:
+      - internal
+
+volumes:
+  postgres-data:
+  garage-meta:
+  garage-data:
+
+networks:
+  internal:
+
+configs:
+  museum-yaml:
+    content: |
+      db:
+        host: postgres
+        port: 5432
+        name: ente_db
+        user: pguser
+        password: pgpass
+      s3:
+        are_local_buckets: true
+        b2-eu-cen:
+          key: __GARAGE_KEY_ID__
+          secret: __GARAGE_KEY_SECRET__
+          endpoint: http://__SERVER_IP__:3200
+          region: garage
+          bucket: b2-eu-cen
+        wasabi-eu-central-2-v3:
+          key: __GARAGE_KEY_ID__
+          secret: __GARAGE_KEY_SECRET__
+          endpoint: http://__SERVER_IP__:3200
+          region: garage
+          bucket: wasabi-eu-central-2-v3
+        scw-eu-fr-v3:
+          key: __GARAGE_KEY_ID__
+          secret: __GARAGE_KEY_SECRET__
+          endpoint: http://__SERVER_IP__:3200
+          region: garage
+          bucket: scw-eu-fr-v3
+      key:
+        encryption: __KEY_ENCRYPTION__
+        hash: __KEY_ENCRYPTION__
+      jwt:
+        secret: __JWT_SECRET__
+      internal:
+        hardcoded-ott:
+          emails:
+            - ".*@example\\.org"
+          value: "123456"
+        admins:
+          - admin@example.org
+      replication:
+        enabled: false
+
+  credentials-yaml:
+    content: |
+      key:
+        encryption: __KEY_ENCRYPTION__
+        hash: __KEY_ENCRYPTION__
+      jwt:
+        secret: __JWT_SECRET__
