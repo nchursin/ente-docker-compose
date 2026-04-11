@@ -140,8 +140,9 @@ configs:
       internal:
         hardcoded-ott:
           emails:
-            - ".*@example\\.org"
-          value: "123456"
+            - "admin@example.org,123456"
+          local-domain-suffix: "@example.org"
+          local-domain-value: "123456"
         admins:
           - admin@example.org
       replication:
