@@ -37,7 +37,7 @@ echo "Using server IP: $SERVER_IP"
 echo ""
 echo "=== Step 1: Generating secrets ==="
 JWT_SECRET=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')
-KEY_ENCRYPTION=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')
+KEY_ENCRYPTION=$(openssl rand -base64 32)
 GARAGE_RPC_SECRET=$(openssl rand -hex 32)
 GARAGE_ADMIN_TOKEN=$(openssl rand -hex 32)
 
