@@ -91,7 +91,7 @@ services:
       - "3003:3003"
       - "3004:3004"
     environment:
-      ENDPOINT: http://__SERVER_IP__:8081
+      ENTE_API_ORIGIN: http://__SERVER_IP__:8081
     networks:
       - internal
 
